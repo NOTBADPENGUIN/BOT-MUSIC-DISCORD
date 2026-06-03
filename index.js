@@ -40,6 +40,7 @@ function ytdlpArgs(extra = []) {
   const args = [
     '--no-warnings',
     '--no-playlist',
+    '--geo-bypass',
     '--extractor-args', 'youtube:player_client=web,android',
   ];
   if (process.env.YOUTUBE_COOKIES && fs.existsSync(COOKIES_PATH)) {
