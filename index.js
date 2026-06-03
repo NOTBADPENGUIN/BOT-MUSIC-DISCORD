@@ -16,37 +16,43 @@ const {
   StreamType,
   entersState,
 } = require('@discordjs/voice');
-const { execFile, spawn } = require('child_process');
+const { spawn } = require('child_process');
+const https = require('https');
 const ffmpegPath = require('ffmpeg-static');
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// Déterminer le chemin de yt-dlp (système sur Railway, local sinon)
-const YTDLP = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+// ─── Invidious (miroir YouTube sans blocage IP) ───────────────────────────────
 
-// Écrire les cookies YouTube dans un fichier temporaire si disponibles
-const fs = require('fs');
-const COOKIES_PATH = '/tmp/youtube_cookies.txt';
-if (process.env.YOUTUBE_COOKIES) {
-  try {
-    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf8');
-    console.log('[Music] Cookies YouTube écrits dans', COOKIES_PATH);
-  } catch (e) {
-    console.warn('[Music] Impossible d\'écrire les cookies:', e.message);
-  }
-}
+const INVIDIOUS_INSTANCES = [
+  'yewtu.be',
+  'inv.nadeko.net',
+  'invidious.privacyredirect.com',
+  'iv.datura.network',
+];
 
-function ytdlpArgs(extra = []) {
-  const args = [
-    '--no-warnings',
-    '--no-playlist',
-    '--geo-bypass',
-    '--extractor-args', 'youtube:player_client=web,android',
-  ];
-  if (process.env.YOUTUBE_COOKIES && fs.existsSync(COOKIES_PATH)) {
-    args.push('--cookies', COOKIES_PATH);
-  }
-  return [...args, ...extra];
+function invFetch(path) {
+  return new Promise(async (resolve, reject) => {
+    for (const host of INVIDIOUS_INSTANCES) {
+      try {
+        const data = await new Promise((res, rej) => {
+          const req = https.get(
+            { hostname: host, path, headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } },
+            (response) => {
+              if (response.statusCode !== 200) { response.resume(); rej(new Error(`HTTP ${response.statusCode}`)); return; }
+              let body = '';
+              response.on('data', c => body += c);
+              response.on('end', () => { try { res(JSON.parse(body)); } catch { rej(new Error('JSON invalide')); } });
+            }
+          );
+          req.on('error', rej);
+          req.setTimeout(10000, () => { req.destroy(); rej(new Error('Timeout')); });
+        });
+        return resolve(data);
+      } catch {}
+    }
+    reject(new Error('Tous les serveurs Invidious sont indisponibles.'));
+  });
 }
 
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
@@ -102,33 +108,29 @@ function cleanYoutubeUrl(url) {
   return url;
 }
 
-// ─── Récupérer les infos d'une vidéo via yt-dlp ──────────────────────────────
-
-function ytdlpInfo(query) {
-  return new Promise((resolve, reject) => {
-    const cleanQuery = isUrl(query) ? cleanYoutubeUrl(query) : query;
-    const args = isUrl(cleanQuery)
-      ? ytdlpArgs(['-j', cleanQuery])
-      : ytdlpArgs(['-j', `ytsearch1:${cleanQuery}`]);
-
-    execFile(YTDLP, args, { timeout: 30000 }, (err, stdout) => {
-      if (err) return reject(new Error(err.message));
-      try {
-        resolve(JSON.parse(stdout.trim().split('\n')[0]));
-      } catch {
-        reject(new Error('Impossible de parser les infos de la vidéo.'));
-      }
-    });
-  });
-}
+// ─── Récupérer les infos d'une vidéo via Invidious ───────────────────────────
 
 async function fetchTrack(query, requestedBy) {
-  const info = await ytdlpInfo(query);
+  let videoId;
+
+  if (isUrl(query)) {
+    const clean = cleanYoutubeUrl(query);
+    videoId = new URL(clean).searchParams.get('v');
+    if (!videoId) throw new Error('URL YouTube invalide.');
+  } else {
+    const results = await invFetch(`/api/v1/search?q=${encodeURIComponent(query)}&type=video`);
+    if (!results?.length) throw new Error('Aucun résultat trouvé.');
+    videoId = results[0].videoId;
+  }
+
+  const info = await invFetch(`/api/v1/videos/${videoId}`);
+
   return {
     title: info.title,
-    url: `https://www.youtube.com/watch?v=${info.id}`,
-    duration: info.duration ?? 0,
-    thumbnail: info.thumbnail ?? null,
+    videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    duration: info.lengthSeconds ?? 0,
+    thumbnail: info.videoThumbnails?.[0]?.url ?? null,
     requestedBy,
   };
 }
@@ -173,28 +175,32 @@ async function joinChannel(state, voiceChannel) {
 
 // ─── Jouer un morceau ─────────────────────────────────────────────────────────
 
+async function getAudioUrl(videoId) {
+  const info = await invFetch(`/api/v1/videos/${videoId}`);
+  const audioFormats = (info.adaptiveFormats ?? [])
+    .filter(f => f.type?.startsWith('audio/') && f.url)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+  if (!audioFormats.length) throw new Error('Aucun format audio disponible.');
+  return audioFormats[0].url;
+}
+
 async function playTrack(guildId, track) {
   const state = getState(guildId);
   try {
-    // yt-dlp récupère l'URL audio directe, ffmpeg la streame
-    const ytdlp = spawn(YTDLP, ytdlpArgs([
-      '-f', 'bestaudio/best',
-      '-o', '-',
-      '--quiet',
-      track.url,
-    ]));
+    const audioUrl = await getAudioUrl(track.videoId);
 
     const ffmpeg = spawn(ffmpegPath, [
-      '-i', 'pipe:0',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', audioUrl,
       '-f', 's16le',
       '-ar', '48000',
       '-ac', '2',
       'pipe:1',
     ]);
 
-    ytdlp.stdout.pipe(ffmpeg.stdin);
-    ytdlp.stderr.on('data', d => console.error('[yt-dlp]', d.toString().trim()));
-    ffmpeg.stderr.on('data', d => {});
+    ffmpeg.stderr.on('data', () => {});
 
     const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
     state.player.play(resource);
