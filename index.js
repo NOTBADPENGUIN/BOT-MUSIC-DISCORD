@@ -24,6 +24,26 @@ process.env.FFMPEG_PATH = ffmpegPath;
 // Déterminer le chemin de yt-dlp (système sur Railway, local sinon)
 const YTDLP = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 
+// Écrire les cookies YouTube dans un fichier temporaire si disponibles
+const fs = require('fs');
+const COOKIES_PATH = '/tmp/youtube_cookies.txt';
+if (process.env.YOUTUBE_COOKIES) {
+  try {
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES, 'utf8');
+    console.log('[Music] Cookies YouTube écrits dans', COOKIES_PATH);
+  } catch (e) {
+    console.warn('[Music] Impossible d\'écrire les cookies:', e.message);
+  }
+}
+
+function ytdlpArgs(extra = []) {
+  const args = ['--no-warnings', '--no-playlist'];
+  if (process.env.YOUTUBE_COOKIES && fs.existsSync(COOKIES_PATH)) {
+    args.push('--cookies', COOKIES_PATH);
+  }
+  return [...args, ...extra];
+}
+
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
 
 const players = new Map(); // guildId → MusicState
@@ -69,8 +89,8 @@ function isUrl(str) {
 function ytdlpInfo(query) {
   return new Promise((resolve, reject) => {
     const args = isUrl(query)
-      ? ['--no-playlist', '-j', '--no-warnings', query]
-      : ['-j', '--no-warnings', `ytsearch1:${query}`];
+      ? ytdlpArgs(['-j', query])
+      : ytdlpArgs(['-j', `ytsearch1:${query}`]);
 
     execFile(YTDLP, args, { timeout: 30000 }, (err, stdout) => {
       if (err) return reject(new Error(err.message));
@@ -138,13 +158,12 @@ async function playTrack(guildId, track) {
   const state = getState(guildId);
   try {
     // yt-dlp récupère l'URL audio directe, ffmpeg la streame
-    const ytdlp = spawn(YTDLP, [
-      '--no-playlist',
+    const ytdlp = spawn(YTDLP, ytdlpArgs([
       '-f', 'bestaudio/best',
       '-o', '-',
       '--quiet',
       track.url,
-    ]);
+    ]));
 
     const ffmpeg = spawn(ffmpegPath, [
       '-i', 'pipe:0',
