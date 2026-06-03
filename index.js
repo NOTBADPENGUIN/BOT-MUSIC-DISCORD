@@ -84,13 +84,27 @@ function isUrl(str) {
   return /^https?:\/\//.test(str);
 }
 
+function cleanYoutubeUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes('youtube.com') && u.searchParams.has('v')) {
+      return `https://www.youtube.com/watch?v=${u.searchParams.get('v')}`;
+    }
+    if (u.hostname.includes('youtu.be')) {
+      return `https://www.youtube.com/watch?v=${u.pathname.slice(1).split('?')[0]}`;
+    }
+  } catch {}
+  return url;
+}
+
 // ─── Récupérer les infos d'une vidéo via yt-dlp ──────────────────────────────
 
 function ytdlpInfo(query) {
   return new Promise((resolve, reject) => {
-    const args = isUrl(query)
-      ? ytdlpArgs(['-j', query])
-      : ytdlpArgs(['-j', `ytsearch1:${query}`]);
+    const cleanQuery = isUrl(query) ? cleanYoutubeUrl(query) : query;
+    const args = isUrl(cleanQuery)
+      ? ytdlpArgs(['-j', cleanQuery])
+      : ytdlpArgs(['-j', `ytsearch1:${cleanQuery}`]);
 
     execFile(YTDLP, args, { timeout: 30000 }, (err, stdout) => {
       if (err) return reject(new Error(err.message));
@@ -489,7 +503,7 @@ client.on('messageCreate', async (message) => {
       return message.reply('❌ Rejoins un salon vocal pour que je puisse jouer ce lien !');
     }
 
-    const url = youtubeMatch[0];
+    const url = cleanYoutubeUrl(youtubeMatch[0]);
     const loadingMsg = await message.reply('🔍 Chargement du lien...');
     const state = getState(message.guild.id);
 
