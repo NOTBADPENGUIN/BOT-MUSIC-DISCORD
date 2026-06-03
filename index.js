@@ -13,24 +13,16 @@ const {
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
+  StreamType,
   entersState,
 } = require('@discordjs/voice');
-const playdl = require('play-dl');
+const { execFile, spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// Configurer play-dl avec les cookies YouTube si disponibles
-(async () => {
-  try {
-    if (process.env.YOUTUBE_COOKIE) {
-      await playdl.setToken({ youtube: { cookie: process.env.YOUTUBE_COOKIE } });
-      console.log('[Music] Cookies YouTube chargés.');
-    }
-  } catch (e) {
-    console.warn('[Music] Impossible de charger les cookies YouTube:', e.message);
-  }
-})();
+// Déterminer le chemin de yt-dlp (système sur Railway, local sinon)
+const YTDLP = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
 
@@ -72,43 +64,34 @@ function isUrl(str) {
   return /^https?:\/\//.test(str);
 }
 
-// ─── Récupérer les infos d'une vidéo YouTube ─────────────────────────────────
+// ─── Récupérer les infos d'une vidéo via yt-dlp ──────────────────────────────
+
+function ytdlpInfo(query) {
+  return new Promise((resolve, reject) => {
+    const args = isUrl(query)
+      ? ['--no-playlist', '-j', '--no-warnings', query]
+      : ['-j', '--no-warnings', `ytsearch1:${query}`];
+
+    execFile(YTDLP, args, { timeout: 30000 }, (err, stdout) => {
+      if (err) return reject(new Error(err.message));
+      try {
+        resolve(JSON.parse(stdout.trim().split('\n')[0]));
+      } catch {
+        reject(new Error('Impossible de parser les infos de la vidéo.'));
+      }
+    });
+  });
+}
 
 async function fetchTrack(query, requestedBy) {
-  // Nettoyer l'URL si nécessaire (enlever les paramètres de playlist, etc.)
-  let cleanQuery = query;
-  if (isUrl(query)) {
-    try {
-      const urlObj = new URL(query);
-      // Garder seulement v= pour les URLs YouTube classiques
-      if (urlObj.hostname.includes('youtube.com') && urlObj.searchParams.has('v')) {
-        cleanQuery = `https://www.youtube.com/watch?v=${urlObj.searchParams.get('v')}`;
-      }
-    } catch {}
-  }
-
-  if (isUrl(cleanQuery)) {
-    const info = await playdl.video_info(cleanQuery);
-    const d = info.video_details;
-    return {
-      title: d.title,
-      url: d.url,
-      duration: d.durationInSec,
-      thumbnail: d.thumbnails?.[0]?.url ?? null,
-      requestedBy,
-    };
-  } else {
-    const results = await playdl.search(cleanQuery, { limit: 1 });
-    if (!results.length) throw new Error('Aucun résultat trouvé.');
-    const v = results[0];
-    return {
-      title: v.title,
-      url: v.url,
-      duration: v.durationInSec,
-      thumbnail: v.thumbnails?.[0]?.url ?? null,
-      requestedBy,
-    };
-  }
+  const info = await ytdlpInfo(query);
+  return {
+    title: info.title,
+    url: `https://www.youtube.com/watch?v=${info.id}`,
+    duration: info.duration ?? 0,
+    thumbnail: info.thumbnail ?? null,
+    requestedBy,
+  };
 }
 
 // ─── Rejoindre le salon vocal ─────────────────────────────────────────────────
@@ -154,8 +137,28 @@ async function joinChannel(state, voiceChannel) {
 async function playTrack(guildId, track) {
   const state = getState(guildId);
   try {
-    const stream = await playdl.stream(track.url);
-    const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    // yt-dlp récupère l'URL audio directe, ffmpeg la streame
+    const ytdlp = spawn(YTDLP, [
+      '--no-playlist',
+      '-f', 'bestaudio/best',
+      '-o', '-',
+      '--quiet',
+      track.url,
+    ]);
+
+    const ffmpeg = spawn(ffmpegPath, [
+      '-i', 'pipe:0',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1',
+    ]);
+
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+    ytdlp.stderr.on('data', d => console.error('[yt-dlp]', d.toString().trim()));
+    ffmpeg.stderr.on('data', d => {});
+
+    const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
     state.player.play(resource);
     await updatePanel(guildId);
   } catch (err) {
