@@ -1,5 +1,1 @@
-[phases.setup]
-nixPkgs = ["nodejs_20", "yt-dlp", "ffmpeg"]
-
-[start]
-cmd = "node index.js"
+# Fichier vide - utilisation du Dockerfile à la place
