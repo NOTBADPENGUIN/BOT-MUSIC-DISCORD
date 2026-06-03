@@ -37,7 +37,11 @@ if (process.env.YOUTUBE_COOKIES) {
 }
 
 function ytdlpArgs(extra = []) {
-  const args = ['--no-warnings', '--no-playlist'];
+  const args = [
+    '--no-warnings',
+    '--no-playlist',
+    '--extractor-args', 'youtube:player_client=web,android',
+  ];
   if (process.env.YOUTUBE_COOKIES && fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
   }
