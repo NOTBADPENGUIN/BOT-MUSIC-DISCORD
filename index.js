@@ -17,19 +17,46 @@ const {
   entersState,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
+const https = require('https');
 const ffmpegPath = require('ffmpeg-static');
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// ─── YouTube via youtubei.js (API interne YouTube) ────────────────────────────
+// ─── Piped API (alternative YouTube, serveurs résidentiels) ──────────────────
 
-let _youtube = null;
-async function getYoutube() {
-  if (!_youtube) {
-    const { Innertube } = await import('youtubei.js');
-    _youtube = await Innertube.create({ retrieve_player: false });
-  }
-  return _youtube;
+const PIPED_API_INSTANCES = [
+  'pipedapi.kavin.rocks',
+  'pipedapi.adminforge.de',
+  'pipedapi.tokhmi.xyz',
+  'pipedapi.moomoo.me',
+  'watchapi.marble.science',
+];
+
+function pipedFetch(path) {
+  return new Promise(async (resolve, reject) => {
+    for (const host of PIPED_API_INSTANCES) {
+      try {
+        const data = await new Promise((res, rej) => {
+          const req = https.get(
+            { hostname: host, path, headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } },
+            (response) => {
+              if (response.statusCode !== 200) { response.resume(); rej(new Error(`HTTP ${response.statusCode}`)); return; }
+              let body = '';
+              response.on('data', c => body += c);
+              response.on('end', () => { try { res(JSON.parse(body)); } catch { rej(new Error('JSON invalide')); } });
+            }
+          );
+          req.on('error', rej);
+          req.setTimeout(15000, () => { req.destroy(); rej(new Error('Timeout')); });
+        });
+        console.log(`[Piped] OK: ${host}`);
+        return resolve(data);
+      } catch (e) {
+        console.warn(`[Piped] Échec ${host}: ${e.message}`);
+      }
+    }
+    reject(new Error('Tous les serveurs Piped sont indisponibles.'));
+  });
 }
 
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
@@ -85,31 +112,33 @@ function cleanYoutubeUrl(url) {
   return url;
 }
 
-// ─── Récupérer les infos d'une vidéo via youtubei.js ─────────────────────────
+// ─── Récupérer les infos d'une vidéo via Piped ───────────────────────────────
 
 async function fetchTrack(query, requestedBy) {
-  const yt = await getYoutube();
-  let videoId, title, duration, thumbnail;
+  let videoId;
 
   if (isUrl(query)) {
     const clean = cleanYoutubeUrl(query);
     videoId = new URL(clean).searchParams.get('v');
     if (!videoId) throw new Error('URL YouTube invalide.');
-    const info = await yt.getBasicInfo(videoId, 'ANDROID');
-    title = info.basic_info.title;
-    duration = info.basic_info.duration ?? 0;
-    thumbnail = info.basic_info.thumbnail?.[0]?.url ?? null;
   } else {
-    const search = await yt.search(query, { type: 'video' });
-    const video = search.videos?.[0];
-    if (!video) throw new Error('Aucun résultat trouvé.');
-    videoId = video.id;
-    title = video.title?.text ?? 'Titre inconnu';
-    duration = video.duration?.seconds ?? 0;
-    thumbnail = video.thumbnails?.[0]?.url ?? null;
+    const results = await pipedFetch(`/search?q=${encodeURIComponent(query)}&filter=videos`);
+    if (!results?.items?.length) throw new Error('Aucun résultat trouvé.');
+    videoId = results.items[0].url.split('v=')[1]?.split('&')[0];
+    if (!videoId) throw new Error('ID vidéo introuvable.');
   }
 
-  return { title, videoId, url: `https://www.youtube.com/watch?v=${videoId}`, duration, thumbnail, requestedBy };
+  const info = await pipedFetch(`/streams/${videoId}`);
+
+  return {
+    title: info.title,
+    videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    duration: info.duration ?? 0,
+    thumbnail: info.thumbnailUrl ?? null,
+    requestedBy,
+    audioStreams: info.audioStreams,
+  };
 }
 
 // ─── Rejoindre le salon vocal ─────────────────────────────────────────────────
@@ -155,16 +184,24 @@ async function joinChannel(state, voiceChannel) {
 async function playTrack(guildId, track) {
   const state = getState(guildId);
   try {
-    const yt = await getYoutube();
-    const info = await yt.getBasicInfo(track.videoId, 'ANDROID');
-    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-    if (!format?.url) throw new Error('Aucun format audio disponible.');
+    // Récupérer les streams audio depuis Piped si pas déjà en cache
+    let audioStreams = track.audioStreams;
+    if (!audioStreams) {
+      const info = await pipedFetch(`/streams/${track.videoId}`);
+      audioStreams = info.audioStreams;
+    }
+
+    const best = (audioStreams ?? [])
+      .filter(s => s.url)
+      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
+
+    if (!best?.url) throw new Error('Aucun flux audio disponible.');
 
     const ffmpeg = spawn(ffmpegPath, [
       '-reconnect', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5',
-      '-i', format.url,
+      '-i', best.url,
       '-f', 's16le',
       '-ar', '48000',
       '-ac', '2',
