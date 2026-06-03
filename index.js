@@ -25,10 +25,16 @@ process.env.FFMPEG_PATH = ffmpegPath;
 // ─── Invidious (miroir YouTube sans blocage IP) ───────────────────────────────
 
 const INVIDIOUS_INSTANCES = [
+  'inv.tux.pizza',
   'yewtu.be',
+  'invidious.slipfox.xyz',
   'inv.nadeko.net',
+  'invidious.lunar.icu',
+  'yt.artemislena.eu',
+  'invidious.reallyaweso.me',
   'invidious.privacyredirect.com',
   'iv.datura.network',
+  'invidious.nerdvpn.de',
 ];
 
 function invFetch(path) {
@@ -48,8 +54,11 @@ function invFetch(path) {
           req.on('error', rej);
           req.setTimeout(10000, () => { req.destroy(); rej(new Error('Timeout')); });
         });
+        console.log(`[Invidious] OK: ${host}`);
         return resolve(data);
-      } catch {}
+      } catch (e) {
+        console.warn(`[Invidious] Échec ${host}: ${e.message}`);
+      }
     }
     reject(new Error('Tous les serveurs Invidious sont indisponibles.'));
   });
