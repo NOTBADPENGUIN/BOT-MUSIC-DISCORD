@@ -20,11 +20,16 @@ const ffmpegPath = require('ffmpeg-static');
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// Autoriser play-dl à streamer YouTube sans cookie
+// Configurer play-dl avec les cookies YouTube si disponibles
 (async () => {
   try {
-    if (playdl.is_expired()) await playdl.refreshToken();
-  } catch {}
+    if (process.env.YOUTUBE_COOKIE) {
+      await playdl.setToken({ youtube: { cookie: process.env.YOUTUBE_COOKIE } });
+      console.log('[Music] Cookies YouTube chargés.');
+    }
+  } catch (e) {
+    console.warn('[Music] Impossible de charger les cookies YouTube:', e.message);
+  }
 })();
 
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
