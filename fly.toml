@@ -1,0 +1,16 @@
+app = "djpenguin-music-bot"
+primary_region = "cdg"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  strategy = "immediate"
+
+[env]
+  NODE_ENV = "production"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
