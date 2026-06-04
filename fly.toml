@@ -1,16 +1,22 @@
-app = "djpenguin-music-bot"
-primary_region = "cdg"
+# fly.toml app configuration file generated for djpenguin-music-bot on 2026-06-04T12:18:08+02:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'djpenguin-music-bot'
+primary_region = 'cdg'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [deploy]
-  strategy = "immediate"
+  strategy = 'immediate'
 
 [env]
-  NODE_ENV = "production"
+  NODE_ENV = 'production'
 
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 512

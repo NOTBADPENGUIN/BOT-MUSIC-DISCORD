@@ -17,46 +17,61 @@ const {
   entersState,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
-const https = require('https');
 const ffmpegPath = require('ffmpeg-static');
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// ─── Piped API (alternative YouTube, serveurs résidentiels) ──────────────────
+// ─── YouTube avec PO Token (bypass bot detection) ────────────────────────────
 
-const PIPED_API_INSTANCES = [
-  'pipedapi.kavin.rocks',
-  'pipedapi.adminforge.de',
-  'pipedapi.tokhmi.xyz',
-  'pipedapi.moomoo.me',
-  'watchapi.marble.science',
-];
+let _ytClient = null;
 
-function pipedFetch(path) {
-  return new Promise(async (resolve, reject) => {
-    for (const host of PIPED_API_INSTANCES) {
-      try {
-        const data = await new Promise((res, rej) => {
-          const req = https.get(
-            { hostname: host, path, headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' } },
-            (response) => {
-              if (response.statusCode !== 200) { response.resume(); rej(new Error(`HTTP ${response.statusCode}`)); return; }
-              let body = '';
-              response.on('data', c => body += c);
-              response.on('end', () => { try { res(JSON.parse(body)); } catch { rej(new Error('JSON invalide')); } });
-            }
-          );
-          req.on('error', rej);
-          req.setTimeout(15000, () => { req.destroy(); rej(new Error('Timeout')); });
-        });
-        console.log(`[Piped] OK: ${host}`);
-        return resolve(data);
-      } catch (e) {
-        console.warn(`[Piped] Échec ${host}: ${e.message}`);
-      }
-    }
-    reject(new Error('Tous les serveurs Piped sont indisponibles.'));
+async function getYTClient() {
+  if (_ytClient) return _ytClient;
+
+  console.log('[YT] Initialisation du client...');
+  const { Innertube } = await import('youtubei.js');
+  const { BG } = await import('bgutils-js');
+
+  // generate_session_locally = nouvelle session fraîche sans réseau (YouTube moins strict)
+  // retrieve_player = charge le JS YouTube pour déchiffrer les URLs audio
+  _ytClient = await Innertube.create({
+    generate_session_locally: true,
+    retrieve_player: true,
   });
+
+  console.log('[YT] Client prêt. Player:', !!_ytClient.session.player);
+
+  // Tenter d'améliorer avec PO Token si possible
+  try {
+    const visitorData = _ytClient.session.context.client.visitorData;
+    const requestKey = 'O43z0dpjhgX20SCx4KAo';
+    const bgChallenge = await BG.Challenge.create({ requestKey });
+    const js = bgChallenge?.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+    if (!js) throw new Error('Challenge JS vide');
+    const bgResponse = await BG.PoToken.generate({
+      program: js,
+      globalName: bgChallenge.globalName,
+      bgConfig: {
+        fetch: (url, opts) => fetch(url, opts),
+        globalObj: globalThis,
+        identifier: visitorData,
+        requestKey,
+      }
+    });
+    console.log('[YT] ✅ PO Token généré !');
+    // Recréer avec PO token en gardant la session locale
+    _ytClient = await Innertube.create({
+      generate_session_locally: true,
+      retrieve_player: true,
+      visitor_data: visitorData,
+      po_token: bgResponse.poToken,
+    });
+    console.log('[YT] Client avec PO Token prêt. Player:', !!_ytClient.session.player);
+  } catch (e) {
+    console.warn('[YT] PO Token non disponible:', e.message?.slice(0, 80));
+  }
+
+  return _ytClient;
 }
 
 // ─── État global du lecteur (un par serveur) ─────────────────────────────────
@@ -112,32 +127,86 @@ function cleanYoutubeUrl(url) {
   return url;
 }
 
-// ─── Récupérer les infos d'une vidéo via Piped ───────────────────────────────
+// ─── Récupérer les infos d'une vidéo ─────────────────────────────────────────
 
 async function fetchTrack(query, requestedBy) {
-  let videoId;
+  const yt = await getYTClient();
+  let videoId, title, duration, thumbnail;
 
   if (isUrl(query)) {
     const clean = cleanYoutubeUrl(query);
     videoId = new URL(clean).searchParams.get('v');
     if (!videoId) throw new Error('URL YouTube invalide.');
   } else {
-    const results = await pipedFetch(`/search?q=${encodeURIComponent(query)}&filter=videos`);
-    if (!results?.items?.length) throw new Error('Aucun résultat trouvé.');
-    videoId = results.items[0].url.split('v=')[1]?.split('&')[0];
-    if (!videoId) throw new Error('ID vidéo introuvable.');
+    const search = await yt.search(query, { type: 'video' });
+    const video = search.videos?.[0];
+    if (!video) throw new Error('Aucun résultat trouvé.');
+    videoId = video.id;
+    title = video.title?.text;
+    duration = video.duration?.seconds ?? 0;
+    thumbnail = video.thumbnails?.[0]?.url ?? null;
   }
 
-  const info = await pipedFetch(`/streams/${videoId}`);
+  // Essayer plusieurs clients pour obtenir les infos de streaming
+  let info;
+  for (const client of ['ANDROID', 'IOS', 'TV_EMBEDDED', undefined]) {
+    try {
+      info = client ? await yt.getBasicInfo(videoId, client) : await yt.getInfo(videoId);
+      if (info.streaming_data) {
+        console.log(`[YT] fetchTrack OK avec client: ${client ?? 'WEB'}`);
+        break;
+      }
+      console.warn(`[YT] fetchTrack ${client ?? 'WEB'}: pas de streaming_data`);
+      info = null;
+    } catch (e) {
+      console.warn(`[YT] fetchTrack ${client ?? 'WEB'} échoué: ${e.message?.slice(0, 80)}`);
+    }
+  }
+  if (!info?.streaming_data) throw new Error('YouTube ne fournit pas les données de streaming depuis ce serveur.');
+
+  title = title ?? info.basic_info?.title ?? 'Titre inconnu';
+  duration = duration || (info.basic_info?.duration ?? 0);
+  thumbnail = thumbnail ?? info.basic_info?.thumbnail?.[0]?.url ?? null;
+
+  // Chercher les formats audio avec URL directe (pas besoin de déchiffrement)
+  const allFormats = [
+    ...(info.streaming_data?.adaptive_formats ?? []),
+    ...(info.streaming_data?.formats ?? []),
+  ];
+  const audioFormats = allFormats.filter(f => f.mime_type?.startsWith('audio/'));
+  const directFormats = audioFormats.filter(f => f.url);
+  const cipheredFormats = audioFormats.filter(f => !f.url);
+
+  console.log(`[YT] Formats audio: ${audioFormats.length} total, ${directFormats.length} direct, ${cipheredFormats.length} chiffrés`);
+
+  // Préférer les URLs directes (pas de déchiffrement requis)
+  const bestFormat = directFormats.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0]
+    ?? info.chooseFormat({ type: 'audio', quality: 'best' });
+
+  if (!bestFormat) throw new Error('Aucun format audio disponible.');
+
+  // Si pas d'URL directe, tenter le déchiffrement via youtubei.js
+  let audioUrl = bestFormat.url ? String(bestFormat.url) : null;
+  if (!audioUrl && bestFormat) {
+    try {
+      // Dans les nouvelles versions de youtubei.js, decipher() est disponible
+      const yt = await getYTClient();
+      if (yt.session.player && bestFormat.decipher) {
+        audioUrl = String(bestFormat.decipher(yt.session.player) ?? '');
+        console.log('[YT] URL déchiffrée:', audioUrl ? audioUrl.slice(0, 80) + '...' : 'ECHEC');
+      }
+    } catch (e) {
+      console.warn('[YT] Déchiffrement manuel échoué:', e.message);
+    }
+  }
+  console.log('[YT] audioUrl final:', audioUrl ? audioUrl.slice(0, 80) + '...' : 'UNDEFINED');
+  if (!audioUrl) throw new Error('URL audio indisponible (déchiffrement requis mais échoué).');
 
   return {
-    title: info.title,
-    videoId,
+    title, videoId,
     url: `https://www.youtube.com/watch?v=${videoId}`,
-    duration: info.duration ?? 0,
-    thumbnail: info.thumbnailUrl ?? null,
-    requestedBy,
-    audioStreams: info.audioStreams,
+    duration: parseInt(duration), thumbnail, requestedBy,
+    audioUrl,
   };
 }
 
@@ -184,31 +253,37 @@ async function joinChannel(state, voiceChannel) {
 async function playTrack(guildId, track) {
   const state = getState(guildId);
   try {
-    // Récupérer les streams audio depuis Piped si pas déjà en cache
-    let audioStreams = track.audioStreams;
-    if (!audioStreams) {
-      const info = await pipedFetch(`/streams/${track.videoId}`);
-      audioStreams = info.audioStreams;
+    // Utiliser l'URL directe stockée depuis fetchTrack
+    let audioUrl = track.audioUrl;
+    if (!audioUrl) {
+      // Rafraîchir si l'URL a expiré
+      const freshTrack = await fetchTrack(track.url, track.requestedBy);
+      audioUrl = freshTrack.audioUrl;
+      track.audioUrl = audioUrl;
     }
-
-    const best = (audioStreams ?? [])
-      .filter(s => s.url)
-      .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0))[0];
-
-    if (!best?.url) throw new Error('Aucun flux audio disponible.');
+    if (!audioUrl) throw new Error('URL audio indisponible.');
+    console.log('[YT] Streaming depuis URL directe:', audioUrl.slice(0, 80) + '...');
 
     const ffmpeg = spawn(ffmpegPath, [
       '-reconnect', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5',
-      '-i', best.url,
-      '-f', 's16le',
-      '-ar', '48000',
-      '-ac', '2',
+      '-i', audioUrl,
+      '-f', 's16le', '-ar', '48000', '-ac', '2',
       'pipe:1',
     ]);
 
-    ffmpeg.stderr.on('data', () => {});
+    ffmpeg.stdout.on('data', chunk => {
+      if (!ffmpeg._logged) { console.log('[ffmpeg] Audio reçu, taille:', chunk.length); ffmpeg._logged = true; }
+    });
+    ffmpeg.stderr.on('data', d => {
+      const msg = d.toString().trim();
+      if (msg && !msg.includes('configuration') && !msg.includes('built with') && !msg.includes('Metadata') && !msg.includes('Duration')) {
+        console.log('[ffmpeg]', msg.slice(0, 150));
+      }
+    });
+    ffmpeg.on('close', code => { if (code !== 0) console.warn('[ffmpeg] Terminé code:', code); });
+
     const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
     state.player.play(resource);
     await updatePanel(guildId);
